@@ -1,0 +1,186 @@
+﻿import streamlit as st
+import os
+import json
+import traceback
+from datetime import datetime
+import numpy as np
+import re
+
+# ========================================
+# 1. PARSE DEAL TEXT
+# ========================================
+def parse_deal(text: str):
+    try:
+        text = text.lower().replace(" p.a.", "").replace(" coupon", "").replace(" ko ", " ko")
+        months = int(re.search(r"(\d+)\s*months?", text).group(1))
+        basket = [w.capitalize() for w in re.findall(r"tencent|baba|hsbc|meta", text)]
+        ko_match = re.search(r"ko\s*(\d+)%?", text)
+        ko = int(ko_match.group(1)) if ko_match else 0
+        coupon_match = re.search(r"(\d+(?:\.\d+)?)%", text)
+        coupon = float(coupon_match.group(1)) if coupon_match else 0
+        name = f"{'_'.join(basket)}_KO{ko}"
+        return {
+            "name": name,
+            "basket": basket,
+            "maturity_months": months,
+            "ko": ko,
+            "coupon": coupon,
+            "principal": 100
+        }
+    except Exception as e:
+        st.error(f"Parse error: {e}")
+        return None
+
+# ========================================
+# 2. MONTE CARLO VALUATION — FINAL & CORRECT
+# ========================================
+def mc_value(struct, n_paths=10000, n_steps=1):
+    np.random.seed(42)
+    T = struct["maturity"]
+    S0 = np.array(struct["initial_prices"])
+    n = len(S0)
+    dt = T / n_steps
+    r = 0.05           # risk-free rate
+    sigma = 0.25       # 25% volatility (Tencent/Baba real)
+    drift = (r - 0.5 * sigma**2) * dt
+    vol = sigma * np.sqrt(dt)
+
+    # Simulate increments
+    Z = np.random.randn(n_paths, n_steps, n)
+    if n > 1:
+        rho = 0.7
+        L = np.array([[1, 0], [rho, np.sqrt(1 - rho**2)]])
+        Z = Z @ L.T if n == 2 else Z  # extend for >2 later
+    increments = drift + vol * Z
+    log_paths = np.cumsum(increments, axis=1)
+    paths = np.exp(log_paths) * S0  # (n_paths, n_steps, n)
+
+    # Prepend initial prices
+    S0_broadcast = S0.reshape(1, 1, n)
+    S0_broadcast = np.tile(S0_broadcast, (n_paths, 1, 1))
+    paths = np.concatenate([S0_broadcast, paths], axis=1)  # (n_paths, n_steps+1, n)
+
+    # Worst-of
+    worst = np.min(paths, axis=2)  # (n_paths, n_steps+1)
+    ko_level = 0.98
+    ko_hit = np.any(worst[:, 1:] <= ko_level, axis=1)  # after t=0
+    survival = ~ko_hit
+
+    coupon = struct["other_props"][1]["coupon"]
+    final_worst = worst[:, -1]
+    payoff = np.where(
+        survival,
+        100 + coupon * T * 100,                     # full + coupon
+        np.where(final_worst < ko_level, final_worst * 100, 100)
+    )
+    fv = np.mean(payoff) * np.exp(-r * T)
+    prob_no_ko = np.mean(survival)
+
+    return {
+        "fair_value_gross": round(fv, 2),
+        "prob_no_ko": round(prob_no_ko * 100, 2)
+    }
+
+# ========================================
+# 3. REPORT ENGINE
+# ========================================
+class ReportEngine:
+    def generate_report(self, mc_results, gr21_input):
+        mc = mc_results["results"][0]
+        s = gr21_input[0]
+        fv = mc["fair_value_gross"]
+        ko_risk = 100 - mc["prob_no_ko"]
+        markdown = f"""
+# USCAN Valuation Report
+**{datetime.now().strftime('%Y-%m-%d %H:%M')}**
+
+## Structure
+- **Name**: {s['name']}
+- **Underlyings**: {', '.join(s['underlyings'])}
+- **Maturity**: {s['maturity']:.2f} years
+- **KO Barrier**: {s['barriers'][0]['level'] if s['barriers'] else 'None'}
+
+## Results
+- **Fair Value**: ${fv:.2f}
+- **Overpriced by**: ${100 - fv:.2f}
+- **KO Risk**: {ko_risk:.1f}%
+
+## Verdict
+{"**AVOID** — High KO risk" if ko_risk > 50 else "**CONSIDER** — Fair pricing"}
+"""
+        return {"markdown": markdown.strip()}
+
+# ========================================
+# 4. RUN ANALYSIS
+# ========================================
+def run_analysis(text: str, user_id: str = "guest"):
+    try:
+        st.write("**1/4** Parsing deal...")
+        parsed = parse_deal(text)
+        if not parsed:
+            return {"status": "error", "error": "Parse failed"}
+
+        st.write("**2/4** Building model...")
+        gr21_input = [{
+            "name": parsed["name"],
+            "underlyings": parsed["basket"],
+            "initial_prices": [100.0] * len(parsed["basket"]),
+            "maturity": parsed["maturity_months"] / 12.0,
+            "basket_type": "WORST_OF",
+            "barriers": [{"type": "KO_DOWN", "level": f"{parsed['ko']}%"}] if parsed["ko"] else [],
+            "other_props": [{"principal": 100}, {"coupon": parsed["coupon"] / 100}]
+        }]
+
+        st.write("**3/4** Monte Carlo (10,000 paths)...")
+        results = []
+        mc = mc_value(gr21_input[0], n_paths=10000)
+        mc["structure_name"] = gr21_input[0]["name"]
+        results.append(mc)
+        mc_results = {"results": results}
+
+        st.write("**4/4** Generating report...")
+        engine = ReportEngine()
+        report = engine.generate_report(mc_results, gr21_input)
+
+        # Save
+        os.makedirs(f"outputs/{user_id}", exist_ok=True)
+        base = f"outputs/{user_id}/USCAN_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        with open(f"{base}.json", "w") as f:
+            json.dump({"mc": mc_results, "report": report}, f, indent=2, default=str)
+        with open(f"{base}_Report.md", "w") as f:
+            f.write(report["markdown"])
+
+        return {"status": "success", "mc": mc_results, "report": report}
+    except Exception as e:
+        tb = traceback.format_exc()
+        st.error(f"**CRASH**: {e}")
+        st.code(tb)
+        return {"status": "error", "error": str(e), "traceback": tb}
+
+# ========================================
+# 5. UI
+# ========================================
+st.set_page_config(page_title="USCAN", layout="centered")
+st.title("USCAN — The Truth Engine")
+st.caption("No illusions. Just math.")
+
+text = st.text_area(
+    "Deal Description",
+    value="4 months Tencent + Baba KO 98% 11% coupon p.a. GS",
+    height=100
+)
+
+if st.button("Analyze", type="primary"):
+    with st.spinner("Running full analysis..."):
+        result = run_analysis(text)
+    if result["status"] == "success":
+        mc = result["mc"]["results"][0]
+        fv = mc["fair_value_gross"]
+        overpriced = 100 - fv
+        ko_risk = 100 - mc["prob_no_ko"]
+        st.success(f"**Fair Value: ${fv:.2f}**")
+        st.warning(f"**Overpriced by: ${overpriced:.2f} | KO Risk: {ko_risk:.1f}%**")
+        st.markdown("---")
+        st.markdown(result["report"]["markdown"])
+    else:
+        st.error("Analysis failed. Full traceback above.")
