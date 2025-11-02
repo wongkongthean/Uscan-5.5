@@ -1,5 +1,5 @@
-# app.py
-import streamlit as st
-from homepage import *
+﻿import streamlit as st
+from homepage import main
 
-# That's it — Render auto-detects
+st.set_page_config(page_title="UScan 5.5", layout="wide")
+main()
